@@ -1,2 +1,18 @@
-# Auto detect text files and perform LF normalization
+# Auto detect text files and perform LF normalization.
 * text=auto
+
+# Shell scripts must keep LF even when checked out on Windows. A CRLF line ending makes
+# bash fail on the shebang and on `set -euo pipefail`; this bit us during bootstrap.
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf
+
+# Media fixtures and model weights are binary and must never be line-ending normalized.
+*.mp4 binary
+*.wav binary
+*.mp3 binary
+*.png binary
+*.jpg binary
+*.gguf binary
+*.bin binary
+*.dump binary
