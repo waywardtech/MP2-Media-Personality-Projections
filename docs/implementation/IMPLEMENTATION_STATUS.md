@@ -28,14 +28,28 @@ running stack. Nothing is marked verified on the strength of the code alone.
 ### Test results
 
 ```
-mp2.sh test               37 passed, 10 skipped   48.9 s
-mp2.sh test-integration   10 passed               21.3 s   (against the live stack)
+mp2.sh test               45 passed, 10 skipped   47.7 s
+mp2.sh test-integration   10 passed               12.4 s   (against the live stack)
 mp2.sh lint               clean
-mp2.sh typecheck          clean (mypy --strict, 19 files)
+mp2.sh typecheck          clean (mypy --strict)
 ```
 
 The 10 skips are the integration tests skipping when no stack is reachable; they pass under
 `test-integration`, which joins the `app` network.
+
+### Scaling measured
+
+A synthetic fixture ladder (varying duration, resolution and shot count independently) was
+analysed end to end. Full results and corpus projections: BENCHMARKS.md.
+
+- **Steady state is faster than realtime**: 300 s of video analysed in 44.4 s (0.15×).
+- **Resolution is the dominant driver.** 4× the pixels costs 3.84× in `ExtractVisual` —
+  essentially linear. Duration scales sub-linearly.
+- **Cold start is ~40 s** of numba JIT in the first `ExtractAudio` of a fresh worker
+  process, then 0.7–6.8 s. One-off per worker, not per work.
+- MP2 adds ~1.96 MB of storage per media-minute, ~98% of it uncompressed normalized audio.
+- Projected 50-work corpus: ~338k measurement rows, ~10.8 GB MP2-added storage, and
+  ~13.6 h (360p) to ~52 h (1080p) of single-worker wall clock.
 
 ### Also verified
 
@@ -128,13 +142,12 @@ None of these were visible without actually running the stack:
 4. **Migration `0001` uses `Base.metadata.create_all`** rather than explicit DDL. It
    produces a correct schema, but `--autogenerate` against later model changes can be
    noisy. Worth replacing with explicit DDL before the schema stabilises.
-5. **OpenTelemetry is scaffolded, not instrumented.** The `ops` profile defines an OTLP
-   collector, a Prometheus scrape and a Grafana dashboard, but **no MP2 service currently
-   emits traces or metrics** — there is no OTel SDK in the images and no instrumentation in
-   the API, worker or gateway. The collector would receive nothing today. Treat the `ops`
-   profile as a placeholder. Adding the SDK plus FastAPI/SQLAlchemy/httpx instrumentation is
-   a contained change, but it requires an image rebuild, which is expensive on this
-   machine's storage (see BENCHMARKS.md).
+5. **OpenTelemetry is implemented but the `ops` backend is still unexercised.** The API,
+   worker and gateway are instrumented (FastAPI, SQLAlchemy, httpx, plus a span per
+   activity) and emit OTLP over HTTP. It is **off by default**: with no
+   `OTEL_EXPORTER_OTLP_ENDPOINT` the whole path is a no-op, which is asserted by tests.
+   What has *not* been done is standing up the `ops` profile and confirming spans arrive in
+   Prometheus/Grafana end to end.
 6. **Line-ending hazard.** Editing files from Windows can introduce CRLF, which breaks
    shell scripts. `.gitattributes` normalizes on commit; the repo was normalized to LF.
 
@@ -146,7 +159,7 @@ None of these were visible without actually running the stack:
 - Any paid or external model processing.
 - Authentication, authorization, TLS, audit logging, secret management (SECURITY.md).
 - `ops`, `gpu` and `llm` Compose profiles have not been started on this machine.
-  (`ui` has been started and verified.)
+  (`ui` and `admin` have been started and verified.)
 
 ## Immediate next steps
 

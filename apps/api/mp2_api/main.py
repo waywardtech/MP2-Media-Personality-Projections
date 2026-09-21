@@ -21,6 +21,7 @@ from mp2_domain.models import (
     Segment,
     SourceAsset,
 )
+from mp2_observability import telemetry
 from mp2_schemas.api import AnalysisRunView, AnalyzeRequest, AssetCreate, MediaCreate, MediaView
 from mp2_storage import LocalObjectStore, ObjectStore, S3ObjectStore
 
@@ -28,6 +29,8 @@ from .config import settings
 from .db import session_scope
 
 app = FastAPI(title="MP2 API", version="0.1.0")
+# No-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set and the SDK is installed.
+telemetry.instrument_fastapi(app, "mp2-api")
 Db = Annotated[Session, Depends(session_scope)]
 
 

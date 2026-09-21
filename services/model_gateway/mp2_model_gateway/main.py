@@ -12,12 +12,14 @@ import os
 import httpx
 from fastapi import FastAPI, HTTPException
 
+from mp2_observability import telemetry
 from mp2_schemas.gateway import ModelGatewayRequest, ModelGatewayResponse
 
 from .adapters import DisabledExternalAdapter, LlamaCppAdapter, ModelAdapter
 from .baseline import DeterministicBaselineAdapter
 
 app = FastAPI(title="MP2 Model Gateway", version="0.1.0")
+telemetry.instrument_fastapi(app, "mp2-model-gateway")
 
 
 def external_enabled() -> bool:

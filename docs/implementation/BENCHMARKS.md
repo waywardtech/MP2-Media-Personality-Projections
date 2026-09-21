@@ -136,19 +136,120 @@ worker-cpu 4 GB / 3 CPUs. The worker is capped at 4 activity threads
 (`MP2_ACTIVITY_THREADS`) and `OMP_NUM_THREADS=3` so numeric libraries do not oversubscribe
 8 threads.
 
+## Scaling
+
+Measured with `mp2.sh bench-fixtures` + `mp2.sh benchmark`, on a synthetic ladder that
+varies duration, resolution and shot count **one at a time** so cost can be attributed to a
+driver rather than inferred from a single clip. Raw results: `data/benchmark-results.json`.
+
+| Fixture | Media | Wall | vs realtime | Segments | Measurements | Claims |
+|---|---:|---:|---:|---:|---:|---:|
+| 8.6 s 320×180, 2 shots (speech) | 8.6 s | 60.6 s | 7.06× | 2 | 17 | 8 |
+| 30 s 640×360, 6 shots | 30.0 s | 15.2 s | 0.51× | 6 | 37 | 24 |
+| 60 s 640×360, 12 shots | 60.0 s | 18.2 s | 0.30× | 12 | 67 | 48 |
+| 60 s 1280×720, 12 shots | 60.0 s | 27.2 s | 0.45× | 12 | 67 | 48 |
+| 300 s 640×360, 60 shots | 300.0 s | 44.4 s | **0.15×** | 60 | 307 | 240 |
+
+**Steady state is faster than realtime.** The 300 s run analysed five minutes of video in
+44 seconds. The apparent 7× on the first row is not a small-file penalty — see cold start.
+
+### Per-activity breakdown (seconds)
+
+| Activity | 8.6 s | 30 s | 60 s 360p | 60 s 720p | 300 s |
+|---|---:|---:|---:|---:|---:|
+| ValidateSource | 0.5 | 0.1 | 0.1 | 0.1 | 0.1 |
+| ProbeAndHash | 0.3 | 0.2 | 0.2 | 0.2 | 0.2 |
+| NormalizeAsset | 0.2 | 0.2 | 0.3 | 0.3 | 0.7 |
+| SegmentShots | 6.6 | 0.6 | 1.2 | 3.0 | 5.5 |
+| **ExtractVisual** | 0.3 | 2.6 | 2.9 | **11.2** | **15.9** |
+| ExtractAudio | **40.2** | 0.7 | 1.7 | 1.3 | 6.8 |
+| Transcribe | 4.8 | 3.0 | 2.2 | 2.2 | 5.9 |
+| BuildScenePackets | 0.1 | 0.2 | 0.3 | 0.3 | 1.0 |
+| InterpretSemantics | 0.3 | 0.2 | 0.3 | 0.3 | 1.1 |
+
+### Cold start dominates the first run
+
+`ExtractAudio` took **40.2 s** on the first analysis and 0.7–6.8 s on every one after. That
+is librosa's numba kernels JIT-compiling on first use in a fresh worker process — a
+one-off cost per worker, not per work. Anything that restarts workers frequently pays it
+repeatedly, which is a reason to prefer long-lived workers over per-job containers.
+
+### Resolution is the dominant driver, not duration
+
+Holding duration and shot count fixed and going 640×360 → 1280×720 (**4× the pixels**):
+
+- `ExtractVisual` 2.9 s → 11.2 s — **3.84×**, i.e. essentially linear in pixel count.
+- Total wall 18.2 s → 27.2 s.
+
+Duration scales sub-linearly (30 s → 60 s cost 15.2 s → 18.2 s), because fixed per-run work
+amortises. Shot count drives segment fan-out: rows scale linearly with segments, but the
+per-segment extraction cost is small compared with resolution.
+
+**Optical flow in `ExtractVisual` is the thing to optimise first** if throughput matters. It
+is currently computed between all sampled frames per segment.
+
+### Rates (from the 300 s run — warmest and largest)
+
+| Per media-minute | Value |
+|---|---:|
+| Wall clock | 8.9 s |
+| Segments | 12.0 |
+| Measurements | 61.4 |
+| Evidence claims | 48.0 |
+| Normalized audio | 1,920,220 B |
+| Derived artifacts | 38,832 B |
+| **MP2-added storage** | **1.96 MB** (excludes the raw source) |
+
+Normalized audio is 16 kHz mono 16-bit PCM — exactly 1.92 MB/min by construction, and
+~98% of MP2-added storage. Encoding it as FLAC would roughly halve total added storage
+at no loss; it is left uncompressed for now because every audio extractor reads it directly.
+
+## Corpus projection
+
+Extrapolated from the measured rates for a **110-minute feature**. These are projections,
+not measurements — no full-length work has been analysed.
+
+| | 640×360 | 1280×720 | 1920×1080 |
+|---|---:|---:|---:|
+| Wall clock per feature | **16.3 min** | **33.7 min** | **62.8 min** |
+| of which ExtractVisual | 5.8 min | 23.3 min | 52.3 min |
+
+At 1080p, visual extraction is ~83% of total time, which follows directly from the linear
+pixel scaling above.
+
+Per feature: ~1,320 segments, ~6,750 measurement rows, ~215 MB MP2-added storage.
+
+**A 50-work corpus** would therefore need roughly:
+
+| | Value |
+|---|---:|
+| Segment rows | ~66,000 |
+| Measurement rows | ~338,000 |
+| Evidence claim rows | ~264,000 |
+| MP2-added storage | **~10.8 GB** (plus the raw sources themselves) |
+| Single-worker wall clock @ 360p | ~13.6 h |
+| Single-worker wall clock @ 1080p | **~52 h** |
+
+Those row counts are unremarkable for PostgreSQL. The constraints are wall clock at full
+resolution and raw-source storage — and on DEV-01 the raw sources would land on a USB
+volume. Analysis is horizontally scalable by task queue, so wall clock is the easier of
+the two to fix.
+
 ## Not measured
 
 Stated explicitly so nothing here is over-read:
 
-- **Full-length feature analysis.** Only short synthetic fixtures have been processed. Do
-  not extrapolate per-second costs from an 8-second clip — shot detection and optical flow
-  scale with resolution and shot count, not just duration.
+- **No real full-length work has been analysed.** The corpus projection above is arithmetic
+  on synthetic measurements. Real film differs in ways that matter: far more shots per
+  minute in action sequences, real dialogue for ASR, variable bitrate, and letterboxing.
 - **Generative inference.** No LLM weights are installed; the llama.cpp path has never run.
+  Every `InterpretSemantics` figure above is the deterministic baseline adapter, which is
+  effectively free (0.2–1.1 s). A generative model would dominate the per-scene cost.
+- **ASR at scale.** Whisper `tiny` on a tone bed is not representative of a real dialogue
+  track; expect `Transcribe` to grow substantially with real speech and a larger model.
 - **GPU throughput.** No CUDA device exists on this machine.
 - **Embedding generation.** sentence-transformers is not installed.
-- **Concurrent analysis runs.** Only one run at a time has been exercised.
-- **Corpus-scale storage growth.** No estimate should be quoted until a full-length work has
-  been analysed end to end.
+- **Concurrent analysis runs.** Every measurement above is a single run at a time.
 
 ## How to reproduce
 
@@ -157,5 +258,8 @@ infra/scripts/mp2.sh up
 infra/scripts/mp2.sh migrate
 infra/scripts/mp2.sh fixture
 infra/scripts/mp2.sh test
-time infra/scripts/mp2.sh down && time infra/scripts/mp2.sh up
+
+# scaling measurements
+infra/scripts/mp2.sh bench-fixtures
+infra/scripts/mp2.sh benchmark
 ```

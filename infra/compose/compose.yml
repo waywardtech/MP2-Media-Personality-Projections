@@ -90,7 +90,7 @@ services:
     ports: ["127.0.0.1:8000:8000"]
     depends_on: {postgres: {condition: service_healthy}, seaweedfs: {condition: service_healthy}}
     healthcheck: {test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"], interval: 10s, timeout: 5s, retries: 10}
-    networks: [edge, app, compute]
+    networks: [edge, app, compute, ops]
     <<: *small
 
   worker-cpu:
@@ -110,7 +110,7 @@ services:
       temporal: {condition: service_healthy}
       seaweedfs: {condition: service_healthy}
       postgres: {condition: service_healthy}
-    networks: [app, compute, model]
+    networks: [app, compute, model, ops]
     deploy: {resources: {limits: {cpus: "3.0", memory: 4G}}}
 
   model-gateway:
@@ -120,7 +120,7 @@ services:
     command: uvicorn mp2_model_gateway.main:app --host 0.0.0.0 --port 8080
     env_file: [../../.env]
     healthcheck: {test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"], interval: 10s, timeout: 5s, retries: 10}
-    networks: [compute, model]
+    networks: [compute, model, ops]
     <<: *small
 
   web:

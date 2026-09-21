@@ -15,9 +15,15 @@ WORKDIR /app
 # numba and OpenCV takes tens of minutes on DEV-01's storage. The dependency list is read
 # out of pyproject.toml rather than duplicated here, so the two cannot drift apart.
 COPY pyproject.toml /app/
-RUN python -c "import tomllib; p=tomllib.load(open('pyproject.toml','rb'))['project']; \
-deps=list(p['dependencies'])+p.get('optional-dependencies',{}).get('extractors',[]); \
-open('/tmp/requirements.txt','w').write('\n'.join(deps)+'\n')" \
+# Which optional groups to install. Override to build a slimmer image, e.g.
+#   --build-arg MP2_EXTRAS=extractors     (no telemetry)
+#   --build-arg MP2_EXTRAS=               (API/gateway only, no extraction stack)
+ARG MP2_EXTRAS=extractors,observability
+ENV MP2_EXTRAS=${MP2_EXTRAS}
+RUN python -c "import tomllib, os; p=tomllib.load(open('pyproject.toml','rb'))['project']; \
+extras=p.get('optional-dependencies',{}); deps=list(p['dependencies']); \
+[deps.extend(extras.get(n,[])) for n in os.environ['MP2_EXTRAS'].split(',') if n]; \
+open('/tmp/requirements.txt','w').write(chr(10).join(deps)+chr(10))" \
     && pip install --no-cache-dir -r /tmp/requirements.txt
 
 # --- Local ASR weights ----------------------------------------------------------------------

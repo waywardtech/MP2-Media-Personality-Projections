@@ -15,10 +15,13 @@ Contract for every activity in this module:
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
+import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +56,7 @@ from mp2_extractors import (
     probe_summary,
     visual_measures,
 )
+from mp2_observability import telemetry
 from mp2_schemas.scene_packet import (
     EVIDENCE_SCHEMA_VERSION,
     ScenePacket,
@@ -74,6 +78,39 @@ from .runtime import (
 log = logging.getLogger("mp2.activities")
 
 State = dict[str, Any]
+
+
+def instrumented(name: str) -> Callable[[Callable[[State], State]], Callable[[State], State]]:
+    """Time an activity, record the duration in state, and emit a span.
+
+    Durations are carried in state and land in `run.evidence_summary`, so per-stage cost
+    is recoverable from the database alone. That matters on a machine with no telemetry
+    backend running: profiling must not depend on the `ops` profile being up.
+
+    The span carries IDs, counts and durations only — never evidence payloads.
+    """
+
+    def decorate(fn: Callable[[State], State]) -> Callable[[State], State]:
+        @functools.wraps(fn)
+        def wrapper(state: State) -> State:
+            started = time.perf_counter()
+            with telemetry.span(
+                f"activity.{name}",
+                analysis_run_id=state.get("analysis_run_id"),
+                source_asset_id=state.get("source_asset_id"),
+                segment_count=len(state.get("segment_ids", [])),
+            ):
+                result = fn(state)
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            timings = dict(result.get("activity_timings_ms", {}))
+            # A retried activity reports the attempt that actually completed.
+            timings[name] = elapsed_ms
+            log.info("activity %s completed in %d ms", name, elapsed_ms)
+            return {**result, "activity_timings_ms": timings}
+
+        return wrapper
+
+    return decorate
 
 
 def _done(state: State, name: str, **extra: Any) -> State:
@@ -127,6 +164,7 @@ def _normalized_path(state: State) -> Path:
 # --- 1. ValidateSource ---------------------------------------------------------------------
 
 @activity.defn(name="ValidateSource")
+@instrumented("ValidateSource")
 def validate_source(state: State) -> State:
     with session_scope() as session:
         asset = _load_asset(session, state)
@@ -145,6 +183,7 @@ def validate_source(state: State) -> State:
 # --- 2. ProbeAndHash -----------------------------------------------------------------------
 
 @activity.defn(name="ProbeAndHash")
+@instrumented("ProbeAndHash")
 def probe_and_hash(state: State) -> State:
     with session_scope() as session:
         asset = _load_asset(session, state)
@@ -169,6 +208,7 @@ def probe_and_hash(state: State) -> State:
 # --- 3. NormalizeAsset ---------------------------------------------------------------------
 
 @activity.defn(name="NormalizeAsset")
+@instrumented("NormalizeAsset")
 def normalize_asset(state: State) -> State:
     if not state.get("has_audio"):
         return _done(state, "NormalizeAsset", normalized_key=None,
@@ -198,6 +238,7 @@ def normalize_asset(state: State) -> State:
 # --- 4. SegmentShots -----------------------------------------------------------------------
 
 @activity.defn(name="SegmentShots")
+@instrumented("SegmentShots")
 def segment_shots(state: State) -> State:
     with session_scope() as session:
         asset = _load_asset(session, state)
@@ -241,6 +282,7 @@ def segment_shots(state: State) -> State:
 # --- 5. ExtractVisual ----------------------------------------------------------------------
 
 @activity.defn(name="ExtractVisual")
+@instrumented("ExtractVisual")
 def extract_visual(state: State) -> State:
     if not state.get("has_video"):
         return _done(state, "ExtractVisual",
@@ -268,6 +310,7 @@ def extract_visual(state: State) -> State:
 # --- 6. ExtractAudio -----------------------------------------------------------------------
 
 @activity.defn(name="ExtractAudio")
+@instrumented("ExtractAudio")
 def extract_audio(state: State) -> State:
     key = state.get("normalized_key")
     if not key:
@@ -301,6 +344,7 @@ def extract_audio(state: State) -> State:
 # --- 7. Transcribe -------------------------------------------------------------------------
 
 @activity.defn(name="Transcribe")
+@instrumented("Transcribe")
 def transcribe(state: State) -> State:
     key = state.get("normalized_key")
     if not key:
@@ -366,6 +410,7 @@ def _measurement_value(session: Any, run_id: uuid.UUID, metric: str,
 
 
 @activity.defn(name="BuildScenePackets")
+@instrumented("BuildScenePackets")
 def build_scene_packets(state: State) -> State:
     with session_scope() as session:
         run_id = _run_id(state)
@@ -421,6 +466,7 @@ def build_scene_packets(state: State) -> State:
 # --- 9. InterpretSemantics -----------------------------------------------------------------
 
 @activity.defn(name="InterpretSemantics")
+@instrumented("InterpretSemantics")
 def interpret_semantics(state: State) -> State:
     """Route scene packets through the MP2 Model Gateway.
 
@@ -537,6 +583,7 @@ def interpret_semantics(state: State) -> State:
 # --- 10. AssembleEvidence ------------------------------------------------------------------
 
 @activity.defn(name="AssembleEvidence")
+@instrumented("AssembleEvidence")
 def assemble_evidence(state: State) -> State:
     with session_scope() as session:
         run_id = _run_id(state)
@@ -557,6 +604,8 @@ def assemble_evidence(state: State) -> State:
             "scene_packet_count": state.get("scene_packet_count", 0),
             "asr_available": state.get("asr_available", False),
             "warnings": state.get("warnings", []),
+            "activity_timings_ms": state.get("activity_timings_ms", {}),
+            "activity_total_ms": sum(state.get("activity_timings_ms", {}).values()),
         }
         upsert_measurement(session, run_id, TEXT_STATISTICS, "run.evidence_summary", summary,
                            source_ref=f"mp2:analysis-run/{run_id}")
@@ -570,21 +619,25 @@ def assemble_evidence(state: State) -> State:
 # values; genome calculation and projection design are explicitly out of scope for M0-M4.
 
 @activity.defn(name="CalculateGenome")
+@instrumented("CalculateGenome")
 def calculate_genome(state: State) -> State:
     return _done(state, "CalculateGenome", genome="deferred-to-M5")
 
 
 @activity.defn(name="BuildProjections")
+@instrumented("BuildProjections")
 def build_projections(state: State) -> State:
     return _done(state, "BuildProjections", projections="deferred-to-M6")
 
 
 @activity.defn(name="ValidateAnalysis")
+@instrumented("ValidateAnalysis")
 def validate_analysis(state: State) -> State:
     return _done(state, "ValidateAnalysis")
 
 
 @activity.defn(name="PublishVersion")
+@instrumented("PublishVersion")
 def publish_version(state: State) -> State:
     return _done(state, "PublishVersion", published="deferred-to-M5")
 

@@ -15,6 +15,8 @@ from concurrent.futures import ThreadPoolExecutor
 from temporalio.client import Client
 from temporalio.worker import Worker
 
+from mp2_observability import telemetry
+
 from .activities import ALL_ACTIVITIES
 from .workflow import AnalyzeMediaWorkflow
 
@@ -30,6 +32,8 @@ WORKFLOW_QUEUE = "mp2-io"
 
 
 async def main() -> None:
+    telemetry.instrument_worker("mp2-worker")
+
     address = os.getenv("MP2_TEMPORAL_ADDRESS", "temporal:7233")
     queues = [q.strip() for q in os.getenv(
         "MP2_TASK_QUEUES", "mp2-io,mp2-cpu,mp2-semantic,mp2-review").split(",") if q.strip()]

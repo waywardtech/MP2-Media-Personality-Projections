@@ -115,10 +115,21 @@ case "$CMD" in
     echo "fixture ready at data/ingest/synthetic-av.mp4"
     ;;
 
+  bench-fixtures)
+    # Synthetic ladder varying duration, resolution and shot count independently.
+    docker run --rm -v "$REPO_ROOT:/repo" -w /repo --entrypoint python mp2-api:latest tools/benchmark/generate_scaling_fixtures.py data/ingest
+    ;;
+
   speech-fixture)
     bash "$REPO_ROOT/tools/corpus/generate_speech_fixture.sh" tests/gold/synthetic-speech.mp4
     cp "$REPO_ROOT/tests/gold/synthetic-speech.mp4" "$REPO_ROOT/data/ingest/synthetic-speech.mp4"
     echo "fixture ready at data/ingest/synthetic-speech.mp4"
+    ;;
+
+  benchmark)
+    # Scaling measurement across the fixture ladder. Needs the core stack up and
+    # `mp2.sh bench-fixtures` already run.
+    docker run --rm --network mp2_app -e MP2_API_URL=http://api:8000 -e MP2_S3_ENDPOINT=http://seaweedfs:8333 -e MP2_S3_ACCESS_KEY="${MP2_S3_ACCESS_KEY:-mp2-dev}" -e MP2_S3_SECRET_KEY="${MP2_S3_SECRET_KEY:-change-me}" -e MP2_S3_REGION=us-east-1 -v "$REPO_ROOT:/repo" -w /repo --entrypoint python mp2-api:latest tools/benchmark/run_scaling_benchmark.py "$@"
     ;;
 
   objects)
@@ -137,6 +148,15 @@ for b in sorted(x["Name"] for x in c.list_buckets()["Buckets"]):
     for o in objs[:20]:
         print(f"   {o['Size']:>12,}  {o['Key']}")
 PY
+    ;;
+
+  sbom)
+    # Works with no external tooling: enumerates what actually shipped in the image.
+    docker run --rm -v "$REPO_ROOT:/repo" -w /repo --entrypoint python mp2-api:latest tools/admin/generate_sbom.py --image mp2-api:latest --out build/sbom/mp2-api.json
+    ;;
+
+  image-lock)
+    bash "$REPO_ROOT/infra/scripts/lock-images.sh"
     ;;
 
   backup)
@@ -211,9 +231,11 @@ MP2 DEV-01 operations
   Database   migrate | migration-status | revision <msg> | psql [args]
              backup | restore <dump-file>
   Storage    objects | clean-derived
+  Supply     sbom | image-lock
+  Benchmark  bench-fixtures | benchmark
   Workflows  workflows | workflow <workflow-id> | queues [task-queue]
   Testing    test [pytest args] | test-integration | lint | typecheck | check
-             fixture | speech-fixture
+             fixture | speech-fixture | bench-fixtures
   Security   local-only | ports
 
 All service and admin ports bind to 127.0.0.1 only. Only the edge profile is ever
