@@ -1,4 +1,4 @@
-from . import asr
+from . import asr, subtitles
 from .media import (
     audio_measures,
     detect_shots,
@@ -19,6 +19,7 @@ from .registry import (
     OPENCV_VISUAL,
     PYSCENEDETECT,
     SENTENCE_EMBEDDING,
+    SUBTITLE_SRT,
     TEXT_STATISTICS,
     ExtractorSpec,
     content_hash,
@@ -34,9 +35,11 @@ __all__ = [
     "OPENCV_VISUAL",
     "PYSCENEDETECT",
     "SENTENCE_EMBEDDING",
+    "SUBTITLE_SRT",
     "TEXT_STATISTICS",
     "ExtractorSpec",
     "asr",
+    "subtitles",
     "audio_measures",
     "content_hash",
     "detect_shots",

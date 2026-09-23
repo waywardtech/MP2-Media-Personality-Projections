@@ -13,6 +13,8 @@ coverage/
 data/raw/
 data/ingest/*
 !data/ingest/.gitkeep
+!data/ingest/external/
+!data/ingest/external/.gitkeep
 data/normalized/
 data/derived/
 models/*.gguf

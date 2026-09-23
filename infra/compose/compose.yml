@@ -86,7 +86,12 @@ services:
     build: {context: ../.., dockerfile: infra/containers/python.Dockerfile}
     command: uvicorn mp2_api.main:app --host 0.0.0.0 --port 8000
     env_file: [../../.env]
-    volumes: ["../../data/ingest:/media:ro"]
+    volumes:
+      - "../../data/ingest:/media:ro"
+      # Optional read-only window onto source material that is too large to copy into the
+      # repo (a film master, a mounted Drive folder). It lands INSIDE the ingest root, so
+      # the API's path-containment check still applies unchanged.
+      - "${MP2_EXTERNAL_INGEST:-../../data/ingest}:/media/external:ro"
     ports: ["127.0.0.1:8000:8000"]
     depends_on: {postgres: {condition: service_healthy}, seaweedfs: {condition: service_healthy}}
     healthcheck: {test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"], interval: 10s, timeout: 5s, retries: 10}
@@ -105,7 +110,10 @@ services:
       MP2_WORK_ROOT: /var/lib/mp2/work
       # Keep numeric libraries from oversubscribing an 8-thread host.
       OMP_NUM_THREADS: "3"
-    volumes: [worker-work:/var/lib/mp2/work]
+    volumes:
+      - worker-work:/var/lib/mp2/work
+      - "../../data/ingest:/media:ro"
+      - "${MP2_EXTERNAL_INGEST:-../../data/ingest}:/media/external:ro"
     depends_on:
       temporal: {condition: service_healthy}
       seaweedfs: {condition: service_healthy}

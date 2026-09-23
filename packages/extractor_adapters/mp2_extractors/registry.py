@@ -164,6 +164,21 @@ SENTENCE_EMBEDDING = ExtractorSpec(
     hardware_class="cpu-or-gpu",
 )
 
+# An authored subtitle track is better evidence than machine ASR, and parsing it is a pure
+# text transform, so this is D0 where faster-whisper is only D1.
+SUBTITLE_SRT = ExtractorSpec(
+    extractor_id="subtitle-srt",
+    version="1",
+    repeatability_class="D0",
+    input_schema_version="subtitle-file/1",
+    # Deliberately the same output contract as ASR: everything downstream is identical
+    # whether the transcript was authored or machine-generated.
+    output_schema_version="asr-transcript/1",
+    parameters={"strip_markup": True, "merge_speaker_dashes": True},
+    license_record="MP2 proprietary",
+    hardware_class="cpu",
+)
+
 TEXT_STATISTICS = ExtractorSpec(
     extractor_id="dialogue-statistics",
     version="1",
@@ -182,6 +197,7 @@ ALL_EXTRACTORS: tuple[ExtractorSpec, ...] = (
     OPENCV_VISUAL,
     LIBROSA_AUDIO,
     FASTER_WHISPER,
+    SUBTITLE_SRT,
     TEXT_STATISTICS,
     SENTENCE_EMBEDDING,
 )

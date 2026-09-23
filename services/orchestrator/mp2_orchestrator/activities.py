@@ -45,6 +45,7 @@ from mp2_extractors import (
     LIBROSA_AUDIO,
     OPENCV_VISUAL,
     PYSCENEDETECT,
+    SUBTITLE_SRT,
     TEXT_STATISTICS,
     asr,
     audio_measures,
@@ -55,6 +56,7 @@ from mp2_extractors import (
     normalize_audio,
     probe_media,
     probe_summary,
+    subtitles,
     visual_measures,
 )
 from mp2_observability import telemetry
@@ -173,6 +175,12 @@ def validate_source(state: State) -> State:
         store = object_store()
         if not store.exists(RAW_BUCKET, asset.object_key):
             raise ValueError(f"raw object missing: {RAW_BUCKET}/{asset.object_key}")
+        run = session.get(AnalysisRun, _run_id(state))
+        # Run parameters are already persisted with the run, so the workflow does not need
+        # to carry them in its input. Merging them here keeps the Temporal payload to IDs
+        # while still letting an operator steer a run (e.g. supplying a subtitle track).
+        if run is not None and run.parameters:
+            state = {**dict(run.parameters), **state}
         _set_status(session, _run_id(state), RunStatus.RUNNING)
         return _done(state, "ValidateSource",
                      object_key=asset.object_key,
@@ -345,26 +353,83 @@ def extract_audio(state: State) -> State:
 
 # --- 7. Transcribe -------------------------------------------------------------------------
 
+def _resolve_subtitle_path(state: State) -> Path | None:
+    """An operator-supplied subtitle track, constrained to the ingest root.
+
+    Same containment rule as asset registration: the path must resolve inside the ingest
+    root, so an analysis parameter cannot be used to read arbitrary container files.
+    """
+    raw = state.get("subtitle_path")
+    if not raw:
+        return None
+    root = Path(os.getenv("MP2_INGEST_ROOT", "/media")).resolve()
+    candidate = Path(str(raw)).resolve()
+    if root != candidate and root not in candidate.parents:
+        log.warning("subtitle_path %s is outside the ingest root; ignoring", candidate)
+        return None
+    return candidate if candidate.is_file() else None
+
+
 @activity.defn(name="Transcribe")
 @instrumented("Transcribe")
 def transcribe(state: State) -> State:
+    """Produce the work's transcript.
+
+    An authored subtitle track wins over machine ASR when one is supplied: it was written
+    by someone who knew the material, it is already timed, and parsing it is D0 where
+    faster-whisper is only D1. The transcript records which source produced it, so a
+    consumer can always tell authored text from a guess.
+    """
+    run_id = _run_id(state)
+    subtitle_path = _resolve_subtitle_path(state)
+
+    if subtitle_path is not None:
+        try:
+            track = subtitles.parse_srt(subtitle_path, SUBTITLE_SRT)
+        except subtitles.SubtitleParseError as exc:
+            log.warning("subtitle track unusable (%s); falling back to ASR", exc)
+            subtitle_path = None
+        else:
+            with session_scope() as session:
+                summary = subtitles.track_summary(track)
+                upsert_measurement(
+                    session, run_id, SUBTITLE_SRT, "transcript.primary",
+                    {"source": "authored-subtitles",
+                     "language": state.get("declared_language"),
+                     "utterance_count": len(track.utterances),
+                     "utterances": track.utterances,
+                     "text": track.text,
+                     "metadata": {**summary, "speaker_identity": "not-derived"}},
+                    source_ref=f"file://{subtitle_path.name}",
+                )
+                count = _write_dialogue_statistics(
+                    session, run_id, state, track.utterances,
+                    source_ref=f"file://{subtitle_path.name}")
+            return _done(state, "Transcribe",
+                         transcript_source="authored-subtitles",
+                         asr_available=asr.is_available(),
+                         asr_utterances=len(track.utterances),
+                         dialogue_segments=count)
+
     key = state.get("normalized_key")
     if not key:
-        return _done(state, "Transcribe", asr_available=False,
-                     warnings=_warn(state, "no normalized audio; ASR skipped"))
+        return _done(state, "Transcribe", transcript_source="none", asr_available=False,
+                     warnings=_warn(state, "no normalized audio and no subtitles; "
+                                           "transcript skipped"))
     if not asr.is_available():
-        return _done(state, "Transcribe", asr_available=False,
-                     warnings=_warn(state, "local ASR weights unavailable; ASR skipped"))
+        return _done(state, "Transcribe", transcript_source="none", asr_available=False,
+                     warnings=_warn(state, "local ASR weights unavailable and no "
+                                           "subtitles; transcript skipped"))
 
     with session_scope() as session:
         store = object_store()
         wav = materialize(store, NORMALIZED_BUCKET, key, _normalized_path(state))
         result = asr.transcribe(wav, FASTER_WHISPER, word_timestamps=True)
-        run_id = _run_id(state)
 
         upsert_measurement(
-            session, run_id, FASTER_WHISPER, "asr.transcript",
-            {"language": result.language,
+            session, run_id, FASTER_WHISPER, "transcript.primary",
+            {"source": "asr",
+             "language": result.language,
              "language_probability": result.language_probability,
              "duration_s": result.duration_s,
              "utterance_count": len(result.utterances),
@@ -373,29 +438,32 @@ def transcribe(state: State) -> State:
              "metadata": result.metadata},
             source_ref=f"s3://{NORMALIZED_BUCKET}/{key}",
         )
+        count = _write_dialogue_statistics(
+            session, run_id, state, result.utterances,
+            source_ref=f"s3://{NORMALIZED_BUCKET}/{key}")
 
-        # Per-segment dialogue statistics, attributed to the shot they fall in.
-        count = 0
-        for segment_id in state.get("segment_ids", []):
-            segment = session.get(Segment, uuid.UUID(segment_id))
-            if segment is None:
-                continue
-            start_s, end_s = segment.start_ms / 1000.0, segment.end_ms / 1000.0
-            local_utterances = [
-                u for u in result.utterances
-                if float(u["end_s"]) > start_s and float(u["start_s"]) < end_s
-            ]
-            stats = dialogue_statistics(local_utterances, max(end_s - start_s, 0.0),
-                                        TEXT_STATISTICS)
-            upsert_measurement(session, run_id, TEXT_STATISTICS, "dialogue.segment_measures",
-                               stats, source_ref=f"s3://{NORMALIZED_BUCKET}/{key}",
-                               segment_id=segment.id)
-            count += 1
-
-        return _done(state, "Transcribe", asr_available=True,
+        return _done(state, "Transcribe", transcript_source="asr", asr_available=True,
                      asr_language=result.language,
                      asr_utterances=len(result.utterances),
                      dialogue_segments=count)
+
+
+def _write_dialogue_statistics(session: Any, run_id: uuid.UUID, state: State,
+                               utterances: list[dict[str, Any]], source_ref: str) -> int:
+    """Per-segment dialogue statistics, attributed to the shot they fall in."""
+    count = 0
+    for segment_id in state.get("segment_ids", []):
+        segment = session.get(Segment, uuid.UUID(segment_id))
+        if segment is None:
+            continue
+        start_s, end_s = segment.start_ms / 1000.0, segment.end_ms / 1000.0
+        local = [u for u in utterances
+                 if float(u["end_s"]) > start_s and float(u["start_s"]) < end_s]
+        stats = dialogue_statistics(local, max(end_s - start_s, 0.0), TEXT_STATISTICS)
+        upsert_measurement(session, run_id, TEXT_STATISTICS, "dialogue.segment_measures",
+                           stats, source_ref=source_ref, segment_id=segment.id)
+        count += 1
+    return count
 
 
 # --- 8. BuildScenePackets ------------------------------------------------------------------
@@ -417,7 +485,7 @@ def build_scene_packets(state: State) -> State:
     with session_scope() as session:
         run_id = _run_id(state)
         store = object_store()
-        transcript = _measurement_value(session, run_id, "asr.transcript", None)
+        transcript = _measurement_value(session, run_id, "transcript.primary", None)
         utterances = list(transcript.get("utterances", []))
 
         packet_keys: list[str] = []
@@ -616,6 +684,7 @@ def assemble_evidence(state: State) -> State:
             "evidence_claim_count": len(claims),
             "segment_count": len(state.get("segment_ids", [])),
             "scene_packet_count": state.get("scene_packet_count", 0),
+            "transcript_source": state.get("transcript_source", "none"),
             "asr_available": state.get("asr_available", False),
             "warnings": state.get("warnings", []),
             "activity_timings_ms": state.get("activity_timings_ms", {}),
