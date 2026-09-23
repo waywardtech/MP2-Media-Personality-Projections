@@ -19,7 +19,16 @@ services:
     # solely to internal networks cannot publish to the host - a ports entry here would be
     # dead configuration implying an exposure that does not exist. Reach it with
     # `mp2.sh psql`, or attach it to `edge` deliberately if you want a host GUI client.
-    healthcheck: {test: [CMD-SHELL, "pg_isready -U mp2 -d mp2"], interval: 10s, timeout: 5s, retries: 10}
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U mp2 -d mp2"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      # After an abrupt stop PostgreSQL replays WAL before accepting connections; on this
+      # machine that measured ~80 s. Without a start_period the health budget expires
+      # during recovery, Compose declares it unhealthy, and every dependent service fails
+      # to start - which looks like corruption but is just recovery being slow.
+      start_period: 180s
     networks: [app]
     <<: *small
 
@@ -76,9 +85,16 @@ services:
     volumes: [seaweed-data:/data]
     # No `ports:` - internal-only, see the note on postgres. Raw object storage is
     # deliberately unreachable from the host and from the web tier.
-    healthcheck: {test: [CMD, wget, -q, -O, /dev/null, "http://127.0.0.1:9333/cluster/status"], interval: 10s, timeout: 5s, retries: 10}
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, "http://127.0.0.1:9333/cluster/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
     networks: [app]
-    deploy: {resources: {limits: {cpus: "1.0", memory: 1200M}}}
+    # Multi-gigabyte multipart uploads are the normal case for MP2, not an edge
+    # case; 1.2G was not enough headroom for an 18 GB film master.
+    deploy: {resources: {limits: {cpus: "1.0", memory: 2G}}}
 
   api:
     profiles: [core]
@@ -94,7 +110,12 @@ services:
       - "${MP2_EXTERNAL_INGEST:-../../data/ingest}:/media/external:ro"
     ports: ["127.0.0.1:8000:8000"]
     depends_on: {postgres: {condition: service_healthy}, seaweedfs: {condition: service_healthy}}
-    healthcheck: {test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"], interval: 10s, timeout: 5s, retries: 10}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
     networks: [edge, app, compute, ops]
     <<: *small
 
@@ -127,7 +148,12 @@ services:
     build: {context: ../.., dockerfile: infra/containers/python.Dockerfile}
     command: uvicorn mp2_model_gateway.main:app --host 0.0.0.0 --port 8080
     env_file: [../../.env]
-    healthcheck: {test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"], interval: 10s, timeout: 5s, retries: 10}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
     networks: [compute, model, ops]
     <<: *small
 

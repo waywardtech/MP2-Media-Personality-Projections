@@ -74,5 +74,5 @@ explicit_package_bases = true
 
 [[tool.mypy.overrides]]
 # Optional extractor dependencies are absent from lightweight environments and ship no stubs.
-module = ["cv2.*", "librosa.*", "scenedetect.*", "faster_whisper.*", "soundfile.*", "boto3.*", "opentelemetry.*"]
+module = ["cv2.*", "librosa.*", "scenedetect.*", "faster_whisper.*", "soundfile.*", "boto3.*", "botocore.*", "opentelemetry.*"]
 ignore_missing_imports = true
