@@ -160,6 +160,10 @@ for b in sorted(x["Name"] for x in c.list_buckets()["Buckets"]):
 PY
     ;;
 
+  doctor)
+    bash "$REPO_ROOT/infra/scripts/doctor.sh" "$@"
+    ;;
+
   sbom)
     # Works with no external tooling: enumerates what actually shipped in the image.
     docker run --rm -v "$REPO_ROOT:/repo" -w /repo --entrypoint python mp2-api:latest tools/admin/generate_sbom.py --image mp2-api:latest --out build/sbom/mp2-api.json
@@ -247,6 +251,7 @@ MP2 DEV-01 operations
   Testing    test [pytest args] | test-integration | lint | typecheck | check
              fixture | speech-fixture | bench-fixtures
   Security   local-only | ports
+  Health     doctor [--repair]
 
 All service and admin ports bind to 127.0.0.1 only. Only the edge profile is ever
 externally exposed. Raw object storage is never reachable from the web tier.

@@ -102,6 +102,67 @@ fail.
 
 ---
 
+## Containers die mid-run and every long job fails "transiently"
+
+**Symptom.** Long-running work — a large ingest, a full analysis, a model server — dies
+part way through with no error of its own. Individual commands work, so each failure looks
+like a one-off. Services report `Up 20 seconds` when they should have been up for an hour.
+
+**Diagnosis.** Ask how often the daemon has been stopping:
+
+```bash
+journalctl --since "1 hour ago" | grep -E "Stop(ping)? docker.service|Started docker.service"
+```
+
+On DEV-01 this showed `Started` / `Stopping` pairs every one to five minutes for hours. Each
+cycle kills every container. The `dockerd` PID changes each time, which distinguishes it
+from a container-level restart.
+
+**Cause.** The WSL distro was being torn down between commands, taking the Docker daemon
+with it. `uptime` is misleading here: WSL2 runs all distros in **one VM with one kernel**,
+so `/proc/uptime` reflects the VM — which another distro (`docker-desktop`) was keeping
+alive — not this distro.
+
+**Fix.** `%USERPROFILE%\.wslconfig` sets `vmIdleTimeout=-1`, but it only applies after:
+
+```powershell
+wsl --shutdown
+```
+
+Confirm it took effect by checking that the configured limits are in force —
+`nproc` should report the configured `processors`, not the host's thread count:
+
+```bash
+nproc; free -h | head -2
+```
+
+Then confirm the distro stops cycling: sample `uptime -s` twice with a minute of no WSL
+session in between. The boot time must not change.
+
+`infra/scripts/mp2.sh doctor` checks all of this.
+
+---
+
+## After a force-quit of Docker Desktop, or an abrupt WSL shutdown
+
+Run the health check before trusting anything:
+
+```bash
+infra/scripts/mp2.sh doctor            # read-only
+infra/scripts/mp2.sh doctor --repair   # act on findings
+```
+
+It extracts every MP2 and infrastructure image, because **there is no `docker fsck`** and a
+truncated layer stays invisible until something next extracts it. It also checks WSL
+resource policy, daemon stability, disk headroom and the named volumes.
+
+PostgreSQL will replay WAL on first start after an abrupt stop; on DEV-01 that took about
+80 seconds, during which it reports `the database system is starting up`. That is recovery
+working, not damage. Verify afterwards with orphan and index checks — a clean database has
+zero orphaned rows and no invalid indexes.
+
+---
+
 ## `unpigz: corrupted -- crc32 mismatch` during a build
 
 **Symptom.** A build fails extracting a base-image layer, and fails again identically on
