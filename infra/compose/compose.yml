@@ -148,12 +148,21 @@ services:
   # The local generative server. It is in its own `llm` profile as well as `gpu` because
   # llama.cpp runs perfectly well on CPU (-ngl 0), and DEV-01 has no NVIDIA GPU: bundling it
   # only with `gpu` would make the local generative path unreachable on this machine.
-  # Requires a GGUF model at models/model.gguf; none is installed (LICENSES_AND_MODELS.md).
+  # Model file is selected by MP2_LLAMA_MODEL_FILE from models/ (gitignored).
+  # Installed weights and their licenses: docs/implementation/LICENSES_AND_MODELS.md.
   llama-server:
     profiles: [llm, gpu]
+    restart: unless-stopped
     image: ghcr.io/ggml-org/llama.cpp:server
-    command: ["-m", "/models/model.gguf", "--host", "0.0.0.0", "--port", "8080",
-              "-ngl", "${MP2_LLAMA_GPU_LAYERS:-0}", "-c", "${MP2_LLAMA_CONTEXT:-4096}"]
+    command: ["-m", "/models/${MP2_LLAMA_MODEL_FILE:-qwen2.5-1.5b-instruct-q4_k_m.gguf}",
+              "--host", "0.0.0.0", "--port", "8080",
+              "-ngl", "${MP2_LLAMA_GPU_LAYERS:-0}",
+              "-c", "${MP2_LLAMA_CONTEXT:-8192}",
+              "-t", "${MP2_LLAMA_THREADS:-4}",
+              # One slot: MP2 issues scene requests sequentially, so parallel slots only
+              # divide the KV cache and add memory pressure for no throughput gain.
+              "-np", "1",
+              "--alias", "${MP2_LLAMA_MODEL_ID:-qwen2.5-1.5b-instruct-q4_k_m}"]
     volumes: ["../../models:/models:ro"]
     networks: [model]
     healthcheck:

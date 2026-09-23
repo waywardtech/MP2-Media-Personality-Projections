@@ -25,7 +25,17 @@ resolve_path() {
   esac
 }
 
-dc() { docker compose "$@"; }
+# Compose interpolates ${VAR} in compose.yml from ITS OWN directory's .env, not from a
+# service's env_file. Without --env-file the repository .env is ignored for interpolation
+# and every ${VAR} silently falls back to its default - including POSTGRES_PASSWORD and the
+# llama model selection. Always point compose at the real project .env.
+dc() {
+  if [ -f "$REPO_ROOT/.env" ]; then
+    docker compose --env-file "$REPO_ROOT/.env" "$@"
+  else
+    docker compose "$@"
+  fi
+}
 
 build_test_image() {
   # Deployable images ship no test runner; the test target adds one on top of the

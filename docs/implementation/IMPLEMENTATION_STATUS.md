@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated 2026-09-21.
+Updated 2026-09-23.
 
 This file distinguishes three things deliberately, because conflating them is how a project
 starts believing its own scaffolding:
@@ -20,7 +20,7 @@ running stack. Nothing is marked verified on the strength of the code alone.
 | **G1** Infrastructure | **Verified** | Six core services healthy (~60 s). Data survived `down`, a cross-volume WSL distro move and a full WSL restart: row counts and SHA-256 unchanged. Migrations `0001`+`0002` applied; all three natural-key constraints present. `pg_dump` produced a 64,654 B dump. |
 | **G2** Ingest | **Verified** | Work registered, asset hashed (SHA-256 matched the fixture exactly), ffprobe probed, object stored in `mp2-raw`, run created, workflow dispatched. Rights metadata enforced (**422**); ingest-root containment enforced (**403** on `/etc/hostname`). Asserted by 3 integration tests. |
 | **G3** Extraction | **Verified** | `synthetic-speech.mp4` (8.58 s) → 2 shot segments (cut at 4,292 ms, the exact fixture midpoint), 17 measurements from 7 extractors. ASR returned `en` at p=0.974 with 2 utterances of real transcribed speech. D0 rerun equality by content hash and D1 by numeric tolerance, including a cross-process check. |
-| **G4** Evidence | **Verified for the local path** | 2 scene packets written to `mp2-derived`; 8 evidence claims, every one linked to a segment, a `model_execution` and non-empty evidence refs; 2 model executions, `execution_location=local`, `estimated_cost=0`. External routing disabled. **The generative (llama.cpp) path is untested** — see deviations. |
+| **G4** Evidence | **Verified, including the generative path** | Scene packets written to `mp2-derived`; every claim linked to a segment, a `model_execution` and non-empty evidence refs; `execution_location=local`, `estimated_cost=0`. External routing disabled. **llama.cpp now exercised end to end** with Qwen2.5-1.5B and 7B under grammar-constrained decoding. |
 | **G5** Resilience | **Verified** | Worker SIGKILLed while the run was in progress; a new worker resumed and the run reached `evidence_ready`. Totals equalled distinct natural keys exactly: measurements 17/17, segments 2/2, claims 8/8, executions 2/2. **Zero duplicate canonical rows.** |
 | **G6** Portability | **Verified** | AST test rejects provider SDK imports in `packages/domain` and `packages/schemas`. Scene packet asserted to contain no genome, projection or provider fields, no media bytes, and to reject unknown fields. No vendor-specific field is needed to read stored evidence. |
 | **G7** Security | **Verified for this stage** | `.env` gitignored and untracked; no credentials in the tree. Worker egress to a public model provider **blocked** (`URLError`) by internal networks. Gateway reports `external_models_enabled=false`, routing to `mp2-deterministic-baseline`. Only `127.0.0.1` publishing. Significant gaps remain — see SECURITY.md. |
@@ -36,6 +36,25 @@ mp2.sh typecheck          clean (mypy --strict)
 
 The 10 skips are the integration tests skipping when no stack is reachable; they pass under
 `test-integration`, which joins the `app` network.
+
+### Generative path proven (2026-09-23)
+
+- **Models installed**: Qwen2.5-1.5B-Instruct and Qwen2.5-7B-Instruct, Q4_K_M GGUF, both
+  **Apache-2.0**. Licence was the binding constraint: Qwen2.5-3B, Gemma and Llama are all
+  ruled out for a proprietary product.
+- **Schema validity is guaranteed by the grammar**, not by the model. llama.cpp decodes
+  against a JSON Schema derived from MP2's own contract, so a small model is a legitimate
+  choice rather than a data-integrity compromise.
+- **Three defects found and fixed by running it**:
+  1. The 1.5B emitted **zero citations** on every claim. `evidence_refs` now has
+     `min_length=1`, so the grammar forces a citation.
+  2. The model echoed the input packet's `scene-packet/1` as its output `schema_version`.
+     That field is now a pinned `Literal`.
+  3. **MP2 recorded the wrong model in lineage.** The adapter reported the *configured*
+     model while llama-server was serving a different one. Provenance now follows the
+     server's own report, and a mismatch is surfaced as a warning. Regression-tested in
+     `tests/unit/test_llama_adapter.py`.
+- The activity now validates every adapter response against the contract before persisting.
 
 ### Scaling measured
 
@@ -133,10 +152,12 @@ None of these were visible without actually running the stack:
    DEV-01 (i7-4770, AMD RX 580). There is no CUDA path. The `gpu` profile is defined but
    unusable here, and everything runs CPU-only. Not a deviation from the architecture —
    the GPU work is still separable.
-2. **The generative local path is untested.** llama.cpp is implemented and wired, but no
-   GGUF weights were approved for download, so no generative model has ever run. The
-   deterministic baseline adapter fills the routing slot (ADR 0002). **Do not report the
-   generative path as working.**
+2. **The generative local path now works, but is not viable at corpus scale here.**
+   Qwen2.5-1.5B and Qwen2.5-7B (both Apache-2.0, Q4_K_M) are installed and exercised end to
+   end. Grammar-constrained decoding makes schema validity a property of the runtime. But
+   per-scene cost is 30 s (1.5B) to 117 s (7B) on this CPU, which is ~11 h to ~43 h per
+   feature and 23 to 89 days for a 50-work corpus. See BENCHMARKS.md for the three ways out
+   (be selective, change granularity, or move the work).
 3. **sentence-transformers is not installed.** It pulls PyTorch (~2.5 GB). The embedding
    adapter is declared in the registry as unavailable, and no embeddings are produced.
 4. **Migration `0001` uses `Base.metadata.create_all`** rather than explicit DDL. It

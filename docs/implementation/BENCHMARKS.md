@@ -235,6 +235,61 @@ resolution and raw-source storage — and on DEV-01 the raw sources would land o
 volume. Analysis is horizontally scalable by task queue, so wall clock is the easier of
 the two to fix.
 
+## Generative interpretation cost
+
+Measured on DEV-01 with one real scene packet (621 prompt tokens), CPU-only,
+grammar-constrained decoding against MP2's `scene-evidence/1` contract.
+
+| Adapter | Per scene | Throughput | Schema valid |
+|---|---:|---:|---|
+| Deterministic baseline | **0.2–1.1 s** | n/a | always (by construction) |
+| Qwen2.5-1.5B Q4_K_M | **30.4 s** | 9.1 tok/s | yes |
+| Qwen2.5-7B Q4_K_M | **116.9 s** | 1.8 tok/s | yes |
+
+### What this costs at corpus scale
+
+A 110-minute feature yields ~1,320 shot segments, and the pipeline currently issues one
+semantic request per segment:
+
+| Adapter | Per feature | 50-work corpus |
+|---|---:|---:|
+| Deterministic baseline | ~15 min | ~12 h |
+| Qwen2.5-1.5B | **~11 h** | **~23 days** |
+| Qwen2.5-7B | **~43 h** | **~89 days** |
+
+Add ~11 minutes of model load time per `llama-server` restart for the 7B, since 4.7 GB has
+to be paged off a USB volume.
+
+**Scene-level generative interpretation is not viable for a 50-work corpus on this
+machine.** That is a hardware conclusion, not a design defect — the pipeline is correct and
+the contract holds — but it has an architectural consequence worth deciding deliberately:
+
+1. **Be selective.** Run deterministic extraction over every scene, and generative
+   interpretation only over scenes that the measurements flag as interesting. The
+   deterministic layer already produces the signal needed to choose. This keeps the
+   generative pass proportional to what it can actually add.
+2. **Change the granularity.** Interpret at act/sequence level over aggregated
+   measurements rather than per shot. ~1,320 requests becomes ~30.
+3. **Move the work.** A GPU, or an external provider through the Model Gateway, which the
+   contract already supports and policy currently disables.
+
+Option 1 or 2 keeps everything local. Both are compatible with the existing contract, so
+this is a scheduling decision rather than a rewrite.
+
+### Quality is the reason to care about model size
+
+Both models produced schema-valid evidence, because the grammar guarantees that. They
+differed in grounding:
+
+- **7B** cited specific measurement fields (`visual_measurements.luminance_mean`) and put
+  measured numbers into `structured_value`.
+- **1.5B** cited whole measurement blocks and over-read the transcript, asserting
+  "fast-paced conversational pacing" with nothing measured to support it.
+
+For an evidence system, grounding discipline is the product. Any quality gate should test
+whether claims are *supported*, not merely well-formed — the schema already guarantees the
+latter and it says nothing about the former.
+
 ## Not measured
 
 Stated explicitly so nothing here is over-read:
@@ -242,9 +297,11 @@ Stated explicitly so nothing here is over-read:
 - **No real full-length work has been analysed.** The corpus projection above is arithmetic
   on synthetic measurements. Real film differs in ways that matter: far more shots per
   minute in action sequences, real dialogue for ASR, variable bitrate, and letterboxing.
-- **Generative inference.** No LLM weights are installed; the llama.cpp path has never run.
-  Every `InterpretSemantics` figure above is the deterministic baseline adapter, which is
-  effectively free (0.2–1.1 s). A generative model would dominate the per-scene cost.
+- **Generative inference at scale.** Both models were measured on a *single* scene packet,
+  not across a full run. Per-scene cost should be stable, but prompt length grows with
+  transcript density in real dialogue, and KV-cache reuse across scenes has not been
+  explored. The `InterpretSemantics` figures in the scaling table above are the
+  deterministic baseline, not a generative model.
 - **ASR at scale.** Whisper `tiny` on a tone bed is not representative of a real dialogue
   track; expect `Transcribe` to grow substantially with real speech and a larger model.
 - **GPU throughput.** No CUDA device exists on this machine.

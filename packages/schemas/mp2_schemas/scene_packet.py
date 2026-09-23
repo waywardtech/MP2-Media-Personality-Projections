@@ -7,12 +7,13 @@ raw source media out of external systems by construction.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCENE_PACKET_SCHEMA_VERSION = "scene-packet/1"
-EVIDENCE_SCHEMA_VERSION = "scene-evidence/1"
+SCENE_PACKET_SCHEMA_VERSION: Final = "scene-packet/1"
+# Final so the value narrows to a Literal and can pin the output contract below.
+EVIDENCE_SCHEMA_VERSION: Final = "scene-evidence/1"
 
 
 class SceneTimeRange(BaseModel):
@@ -79,13 +80,34 @@ class SceneEvidenceClaim(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    claim_type: str
+    claim_type: str = Field(min_length=1, max_length=255)
     structured_value: dict[str, Any]
     confidence: float = Field(ge=0, le=1)
-    evidence_refs: list[str] = Field(default_factory=list)
+    # Non-empty by contract. A claim that cannot say what it rests on is not evidence, and
+    # because the local runtime decodes against this schema, the grammar itself forces a
+    # citation rather than relying on the model to volunteer one.
+    evidence_refs: list[str] = Field(min_length=1)
 
 
 class SceneEvidenceOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    schema_version: str = EVIDENCE_SCHEMA_VERSION
+    # Pinned: a model asked to emit this contract must not echo the input packet's
+    # schema_version, which is exactly what an unconstrained field invites.
+    schema_version: Literal["scene-evidence/1"] = EVIDENCE_SCHEMA_VERSION
     claims: list[SceneEvidenceClaim] = Field(default_factory=list)
+
+
+# --- Output schema registry -------------------------------------------------------------
+# A gateway request names the contract it wants by id. Resolving that id to a JSON Schema
+# lets a local runtime constrain decoding, which makes schema validity a property of the
+# grammar rather than something the model is merely asked for.
+
+OUTPUT_SCHEMAS: dict[str, type[BaseModel]] = {
+    EVIDENCE_SCHEMA_VERSION: SceneEvidenceOutput,
+}
+
+
+def json_schema_for(output_schema_id: str) -> dict[str, Any] | None:
+    """JSON Schema for a declared output contract, or None if MP2 does not own it."""
+    model = OUTPUT_SCHEMAS.get(output_schema_id)
+    return model.model_json_schema() if model is not None else None

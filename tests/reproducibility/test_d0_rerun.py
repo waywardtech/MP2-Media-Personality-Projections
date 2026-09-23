@@ -10,8 +10,10 @@ These tests need ffmpeg/OpenCV and the generated fixture, so they run inside the
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -117,17 +119,24 @@ def test_audio_measures_are_stable_within_d1_tolerance(tmp_path: Path) -> None:
 
 @requires_ffmpeg
 @requires_fixture
-def test_extraction_is_reproducible_across_processes(tmp_path: Path) -> None:
-    """Guards against hidden in-process caching making a rerun look stable."""
+def test_extraction_is_reproducible_across_processes() -> None:
+    """Guards against hidden in-process caching making a rerun look stable.
+
+    The subprocess inherits this interpreter and an explicit PYTHONPATH, so the test
+    behaves identically whether MP2 is pip-installed (as in the image) or merely on
+    pytest's path (as in a bare checkout).
+    """
     script = (
-        "import json;"
+        "from pathlib import Path;"
         "from mp2_extractors import probe_media, probe_summary, content_hash;"
-        "print(content_hash(probe_summary(probe_media(__import__('pathlib')"
-        ".Path('tests/gold/synthetic-av.mp4')))))"
+        "print(content_hash(probe_summary(probe_media("
+        "Path('tests/gold/synthetic-av.mp4')))))"
     )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
     runs = [
-        subprocess.run(["python", "-c", script], capture_output=True, text=True, check=True)
-        .stdout.strip()
+        subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                       check=True, env=env).stdout.strip()
         for _ in range(2)
     ]
     assert runs[0] == runs[1]

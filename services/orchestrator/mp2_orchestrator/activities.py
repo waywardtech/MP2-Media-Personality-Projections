@@ -25,6 +25,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import select
 from temporalio import activity
 
@@ -59,6 +60,7 @@ from mp2_extractors import (
 from mp2_observability import telemetry
 from mp2_schemas.scene_packet import (
     EVIDENCE_SCHEMA_VERSION,
+    SceneEvidenceOutput,
     ScenePacket,
     SceneTimeRange,
 )
@@ -523,6 +525,19 @@ def interpret_semantics(state: State) -> State:
                 failures += 1
                 continue
 
+            # Validate before persisting. Grammar-constrained decoding should make this
+            # redundant for the local adapter, but MP2 must not store claims it has not
+            # checked - a different adapter, or an ungrammared fallback, can return
+            # anything, and a malformed claim in the evidence table is worse than none.
+            try:
+                evidence_output = SceneEvidenceOutput.model_validate(
+                    body.get("structured_output", {}))
+            except PydanticValidationError as exc:
+                log.warning("segment %s: adapter returned schema-invalid evidence: %s",
+                            segment_id, exc.error_count())
+                failures += 1
+                continue
+
             execution = session.scalar(
                 select(ModelExecution).where(
                     ModelExecution.request_id == uuid.UUID(request["request_id"]))
@@ -546,27 +561,26 @@ def interpret_semantics(state: State) -> State:
                 session.add(execution)
                 session.flush()
 
-            for claim in body.get("structured_output", {}).get("claims", []):
+            for claim in evidence_output.claims:
                 existing = session.scalar(
                     select(EvidenceClaim).where(
                         EvidenceClaim.analysis_run_id == run_id,
                         EvidenceClaim.segment_id == segment_id,
-                        EvidenceClaim.claim_type == claim["claim_type"],
+                        EvidenceClaim.claim_type == claim.claim_type,
                     )
                 )
-                refs = list(claim.get("evidence_refs", [])) or [
-                    f"s3://{DERIVED_BUCKET}/{key}"]
+                refs = list(claim.evidence_refs) or [f"s3://{DERIVED_BUCKET}/{key}"]
                 if existing is not None:
-                    existing.structured_value = claim["structured_value"]
-                    existing.confidence = float(claim["confidence"])
+                    existing.structured_value = claim.structured_value
+                    existing.confidence = claim.confidence
                     existing.evidence_refs = refs
                     existing.model_execution_id = execution.id
                     continue
                 session.add(EvidenceClaim(
                     analysis_run_id=run_id, segment_id=segment_id,
-                    model_execution_id=execution.id, claim_type=claim["claim_type"],
-                    structured_value=claim["structured_value"],
-                    confidence=float(claim["confidence"]), evidence_refs=refs,
+                    model_execution_id=execution.id, claim_type=claim.claim_type,
+                    structured_value=claim.structured_value,
+                    confidence=claim.confidence, evidence_refs=refs,
                     schema_version=EVIDENCE_SCHEMA_VERSION,
                 ))
                 created += 1
