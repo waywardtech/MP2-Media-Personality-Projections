@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mp2"
+version = "0.1.0"
+description = "Private media personality projection evidence platform"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.14,<2",
+  "boto3>=1.35,<2",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "psycopg[binary]>=3.2,<4",
+  "sqlalchemy>=2.0,<3",
+  "temporalio>=1.8,<2",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+extractors = [
+  "faster-whisper>=1.1,<2",
+  "librosa>=0.10,<1",
+  "numpy>=2.1,<3",
+  "opencv-python-headless>=4.10,<5",
+  "scenedetect[opencv]>=0.6.5,<1",
+  "soundfile>=0.12,<1",
+]
+# Embedding stack is separated: sentence-transformers pulls PyTorch (~2.5 GB) and is
+# not required for the M0-M4 vertical slice. Install explicitly when embeddings are wanted.
+embeddings = ["sentence-transformers>=3.3,<4"]
+# OpenTelemetry is OTLP-only: no observability vendor SDK is ever imported. Services
+# degrade to a no-op when the SDK is absent or no endpoint is configured.
+observability = [
+  "opentelemetry-sdk>=1.29,<2",
+  "opentelemetry-exporter-otlp-proto-http>=1.29,<2",
+  "opentelemetry-instrumentation-fastapi>=0.50b0",
+  "opentelemetry-instrumentation-sqlalchemy>=0.50b0",
+  "opentelemetry-instrumentation-httpx>=0.50b0",
+]
+dev = ["mypy>=1.14,<2", "pytest>=8.3,<9", "pytest-asyncio>=0.25,<1", "ruff>=0.9,<1"]
+
+[tool.setuptools.packages.find]
+where = ["apps/api", "services/orchestrator", "services/model_gateway", "packages/domain", "packages/schemas", "packages/storage", "packages/extractor_adapters", "packages/observability"]
+
+[tool.pytest.ini_options]
+pythonpath = ["apps/api", "services/orchestrator", "services/model_gateway", "packages/domain", "packages/schemas", "packages/storage", "packages/extractor_adapters", "packages/observability"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.isort]
+# MP2's own packages are first-party even though they live in separate source roots.
+known-first-party = ["mp2_api", "mp2_domain", "mp2_extractors", "mp2_model_gateway",
+                     "mp2_observability", "mp2_orchestrator", "mp2_schemas",
+                     "mp2_storage"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+# MP2 packages live in separate source roots, so mypy needs them all on its path.
+mypy_path = "apps/api:services/orchestrator:services/model_gateway:packages/domain:packages/schemas:packages/storage:packages/extractor_adapters:packages/observability"
+packages = ["mp2_api", "mp2_domain", "mp2_schemas", "mp2_storage", "mp2_model_gateway", "mp2_observability"]
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+# Optional extractor dependencies are absent from lightweight environments and ship no stubs.
+module = ["cv2.*", "librosa.*", "scenedetect.*", "faster_whisper.*", "soundfile.*", "boto3.*", "botocore.*", "opentelemetry.*"]
+ignore_missing_imports = true

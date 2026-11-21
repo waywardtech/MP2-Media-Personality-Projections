@@ -1,0 +1,249 @@
+name: mp2
+
+x-small: &small
+  deploy:
+    resources:
+      limits: {cpus: "1.0", memory: 1G}
+
+services:
+  postgres:
+    profiles: [core]
+    restart: unless-stopped
+    image: pgvector/pgvector:pg18
+    environment:
+      POSTGRES_USER: mp2
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mp2-dev-only}
+      POSTGRES_DB: mp2
+    volumes: [postgres-data:/var/lib/postgresql]
+    # No `ports:`. postgres is on the internal `app` network only, and a container attached
+    # solely to internal networks cannot publish to the host - a ports entry here would be
+    # dead configuration implying an exposure that does not exist. Reach it with
+    # `mp2.sh psql`, or attach it to `edge` deliberately if you want a host GUI client.
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U mp2 -d mp2"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      # After an abrupt stop PostgreSQL replays WAL before accepting connections; on this
+      # machine that measured ~80 s. Without a start_period the health budget expires
+      # during recovery, Compose declares it unhealthy, and every dependent service fails
+      # to start - which looks like corruption but is just recovery being slow.
+      start_period: 180s
+    networks: [app]
+    <<: *small
+
+  temporal:
+    profiles: [core]
+    restart: unless-stopped
+    image: temporalio/auto-setup:1.28
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: mp2
+      POSTGRES_PWD: ${POSTGRES_PASSWORD:-mp2-dev-only}
+      POSTGRES_SEEDS: postgres
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/docker.yaml
+    depends_on: {postgres: {condition: service_healthy}}
+    # No `ports:` - internal-only, see the note on postgres. Clients live in containers.
+    # temporalio/auto-setup binds the frontend to ONE auto-detected interface address, not
+    # 0.0.0.0. On two networks, Docker DNS can hand out the other address and every
+    # connection is refused even though the server is healthy. Keep temporal on `app` only:
+    # the api, workers and temporal-ui are all attached to `app`.
+    networks: [app]
+    healthcheck:
+      # `tctl` is deprecated; the `temporal` CLI is the supported client. The address must
+      # be the service name: auto-setup binds only to its network interface, not to
+      # loopback, so a 127.0.0.1 health check is refused even on a healthy server.
+      test: [CMD, temporal, operator, cluster, health, --address, "temporal:7233"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      # Schema setup plus first start is slow on constrained storage; without this the
+      # container is declared unhealthy before it has finished starting.
+      start_period: 180s
+    deploy: {resources: {limits: {cpus: "1.5", memory: 1500M}}}
+
+  temporal-ui:
+    profiles: [admin]
+    image: temporalio/ui:2.42.1
+    environment: {TEMPORAL_ADDRESS: temporal:7233}
+    ports: ["127.0.0.1:8233:8080"]
+    # `edge` membership is what makes a published port actually reachable from the host;
+    # binding to 127.0.0.1 is what keeps it local-only.
+    networks: [edge, app]
+    depends_on: [temporal]
+    <<: *small
+
+  seaweedfs:
+    profiles: [core]
+    restart: unless-stopped
+    image: chrislusf/seaweedfs:3.80
+    command: "server -s3 -dir=/data -ip=seaweedfs"
+    environment:
+      AWS_ACCESS_KEY_ID: ${MP2_S3_ACCESS_KEY:-mp2-dev}
+      AWS_SECRET_ACCESS_KEY: ${MP2_S3_SECRET_KEY:-change-me}
+    volumes: [seaweed-data:/data]
+    # No `ports:` - internal-only, see the note on postgres. Raw object storage is
+    # deliberately unreachable from the host and from the web tier.
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, "http://127.0.0.1:9333/cluster/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks: [app]
+    # Multi-gigabyte multipart uploads are the normal case for MP2, not an edge
+    # case; 1.2G was not enough headroom for an 18 GB film master.
+    deploy: {resources: {limits: {cpus: "1.0", memory: 2G}}}
+
+  api:
+    profiles: [core]
+    restart: unless-stopped
+    build: {context: ../.., dockerfile: infra/containers/python.Dockerfile}
+    command: uvicorn mp2_api.main:app --host 0.0.0.0 --port 8000
+    env_file: [../../.env]
+    volumes:
+      - "../../data/ingest:/media:ro"
+      # Optional read-only window onto source material that is too large to copy into the
+      # repo (a film master, a mounted Drive folder). It lands INSIDE the ingest root, so
+      # the API's path-containment check still applies unchanged.
+      - "${MP2_EXTERNAL_INGEST:-../../data/ingest}:/media/external:ro"
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on: {postgres: {condition: service_healthy}, seaweedfs: {condition: service_healthy}}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks: [edge, app, compute, ops]
+    <<: *small
+
+  worker-cpu:
+    profiles: [core]
+    restart: unless-stopped
+    build: {context: ../.., dockerfile: infra/containers/python.Dockerfile}
+    command: python -m mp2_orchestrator.worker
+    env_file: [../../.env]
+    environment:
+      MP2_TASK_QUEUES: "mp2-io,mp2-cpu,mp2-semantic,mp2-review"
+      MP2_MODEL_GATEWAY_URL: http://model-gateway:8080
+      MP2_WORK_ROOT: /var/lib/mp2/work
+      # Keep numeric libraries from oversubscribing an 8-thread host.
+      OMP_NUM_THREADS: "3"
+    volumes:
+      - worker-work:/var/lib/mp2/work
+      - "../../data/ingest:/media:ro"
+      - "${MP2_EXTERNAL_INGEST:-../../data/ingest}:/media/external:ro"
+    depends_on:
+      temporal: {condition: service_healthy}
+      seaweedfs: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+    networks: [app, compute, model, ops]
+    deploy: {resources: {limits: {cpus: "3.0", memory: 4G}}}
+
+  model-gateway:
+    profiles: [core]
+    restart: unless-stopped
+    build: {context: ../.., dockerfile: infra/containers/python.Dockerfile}
+    command: uvicorn mp2_model_gateway.main:app --host 0.0.0.0 --port 8080
+    env_file: [../../.env]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks: [compute, model, ops]
+    <<: *small
+
+  web:
+    profiles: [ui]
+    build: {context: ../.., dockerfile: infra/containers/web.Dockerfile}
+    ports: ["127.0.0.1:5173:80"]
+    networks: [edge]
+    depends_on: [api]
+    <<: *small
+
+  worker-gpu:
+    profiles: [gpu]
+    restart: unless-stopped
+    build: {context: ../.., dockerfile: infra/containers/python.Dockerfile}
+    command: python -m mp2_orchestrator.worker
+    env_file: [../../.env]
+    environment:
+      MP2_TASK_QUEUES: mp2-gpu
+      MP2_MODEL_GATEWAY_URL: http://model-gateway:8080
+      MP2_WORK_ROOT: /var/lib/mp2/work
+    volumes: [worker-work:/var/lib/mp2/work]
+    networks: [app, compute, model]
+    deploy: {resources: {limits: {cpus: "2.0", memory: 3G}}}
+
+  # The local generative server. It is in its own `llm` profile as well as `gpu` because
+  # llama.cpp runs perfectly well on CPU (-ngl 0), and DEV-01 has no NVIDIA GPU: bundling it
+  # only with `gpu` would make the local generative path unreachable on this machine.
+  # Model file is selected by MP2_LLAMA_MODEL_FILE from models/ (gitignored).
+  # Installed weights and their licenses: docs/implementation/LICENSES_AND_MODELS.md.
+  llama-server:
+    profiles: [llm, gpu]
+    restart: unless-stopped
+    image: ghcr.io/ggml-org/llama.cpp:server
+    command: ["-m", "/models/${MP2_LLAMA_MODEL_FILE:-qwen2.5-1.5b-instruct-q4_k_m.gguf}",
+              "--host", "0.0.0.0", "--port", "8080",
+              "-ngl", "${MP2_LLAMA_GPU_LAYERS:-0}",
+              "-c", "${MP2_LLAMA_CONTEXT:-8192}",
+              "-t", "${MP2_LLAMA_THREADS:-4}",
+              # One slot: MP2 issues scene requests sequentially, so parallel slots only
+              # divide the KV cache and add memory pressure for no throughput gain.
+              "-np", "1",
+              "--alias", "${MP2_LLAMA_MODEL_ID:-qwen2.5-1.5b-instruct-q4_k_m}"]
+    volumes: ["../../models:/models:ro"]
+    networks: [model]
+    healthcheck:
+      test: [CMD-SHELL, "curl -fsS http://127.0.0.1:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    deploy: {resources: {limits: {cpus: "4.0", memory: 5G}}}
+
+  otel-collector:
+    profiles: [ops]
+    image: otel/opentelemetry-collector-contrib:0.119.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes: ["../containers/otel-collector.yaml:/etc/otelcol/config.yaml:ro"]
+    ports: ["127.0.0.1:4317:4317", "127.0.0.1:4318:4318"]
+    networks: [edge, ops]
+    <<: *small
+
+  prometheus:
+    profiles: [ops]
+    image: prom/prometheus:v3.1.0
+    volumes: ["../containers/prometheus.yml:/etc/prometheus/prometheus.yml:ro", prometheus-data:/prometheus]
+    ports: ["127.0.0.1:9090:9090"]
+    networks: [edge, ops]
+    <<: *small
+
+  grafana:
+    profiles: [ops]
+    image: grafana/grafana:11.4.0
+    environment: {GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-change-me}"}
+    volumes: [grafana-data:/var/lib/grafana]
+    ports: ["127.0.0.1:3000:3000"]
+    networks: [edge, ops]
+    <<: *small
+
+networks:
+  edge: {internal: false}
+  app: {internal: true}
+  compute: {internal: true}
+  model: {internal: true}
+  ops: {internal: true}
+
+volumes:
+  postgres-data:
+  seaweed-data:
+  prometheus-data:
+  grafana-data:
+  # Disposable per-run scratch. Safe to delete; every activity re-materializes what it needs.
+  worker-work:

@@ -1,0 +1,14 @@
+{
+  "schema_version": "scene-packet/1.0",
+  "scene_id": "synthetic-001-scene-0001",
+  "time_range": {"start_ms": 0, "end_ms": 3000},
+  "transcript_text": "This is a synthetic test fixture.",
+  "measurement_refs": ["measurement:00000000-0000-0000-0000-000000000001"],
+  "selected_measurements": {"luminance.mean": 0.48},
+  "representative_frame_refs": ["s3://mp2-derived/synthetic/frame-0001.png"],
+  "frame_embedding_refs": [],
+  "audio_music_measurements": {"rms.mean": 0.12},
+  "context_summaries": [],
+  "known_character_aliases": {},
+  "schema_instruction": "Return only schema-valid evidence claims; do not infer genome values."
+}

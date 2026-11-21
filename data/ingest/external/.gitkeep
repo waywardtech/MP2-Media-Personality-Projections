@@ -1,0 +1,4 @@
+# Mountpoint for MP2_EXTERNAL_INGEST.
+#
+# Docker cannot create /media/external inside the read-only /media bind, so the
+# directory must already exist in the bind source. Keep this file.
